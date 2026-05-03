@@ -3,19 +3,24 @@ import sqlite3
 import os
 from datetime import datetime
 from typing import Optional
+import logging
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8655931539:AAE9DjvBYScMBrutC17TP0UaLBc_jj_bo2U"  # Замените на ваш токен
 ADMIN_IDS = [7673683792]  # ID администраторов (укажите свой ID)
-STAR_PRICE = 500
+STAR_PRICE = 500  # Цена удаления в звёздах
 
 # ================= СОСТОЯНИЯ FSM =================
 class ReportStates(StatesGroup):
@@ -32,17 +37,27 @@ class AdminRemoveStates(StatesGroup):
 class AdminLabelStates(StatesGroup):
     waiting_for_username = State()
 
+class MailingStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_confirmation = State()
+
 # ================= ИНИЦИАЛИЗАЦИЯ =================
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# Получаем путь к директории бота
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'scambase.db')
+
 
 # ================= РАБОТА С БАЗОЙ ДАННЫХ =================
 def init_db():
-    conn = sqlite3.connect('scambase.db')
+    """Инициализация базы данных (не удаляется при перезагрузке)"""
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     
+    # Таблица пользователей в ScamBase
     cur.execute('''
         CREATE TABLE IF NOT EXISTS scambase (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +70,7 @@ def init_db():
         )
     ''')
     
+    # Таблица заявок от пользователей
     cur.execute('''
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,8 +83,34 @@ def init_db():
         )
     ''')
     
+    # Таблица для отслеживания оплат
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            amount INTEGER,
+            payment_id TEXT,
+            status TEXT DEFAULT 'pending',
+            payment_date TEXT
+        )
+    ''')
+    
+    # Таблица для пользователей (для рассылки)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            joined_date TEXT,
+            last_activity TEXT
+        )
+    ''')
+    
     conn.commit()
     conn.close()
+    logger.info("База данных инициализирована: %s", DB_PATH)
 
 
 def normalize_username(username: str) -> str:
@@ -79,7 +121,7 @@ def normalize_username(username: str) -> str:
 def is_in_scambase(username: str) -> Optional[str]:
     """Проверка, есть ли человек в базе"""
     normalized = normalize_username(username)
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('SELECT label FROM scambase WHERE LOWER(username) = ?', (normalized,))
     result = cur.fetchone()
@@ -91,20 +133,15 @@ def add_to_scambase(username: str, label: str, admin_id: int, proof_photos: str 
     """Добавление в базу"""
     try:
         normalized = normalize_username(username)
-        conn = sqlite3.connect('scambase.db')
+        conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute('''
             INSERT INTO scambase (username, label, added_by, added_date, proof_photos, proof_videos)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (normalized, label, admin_id, datetime.now().isoformat(), proof_photos, proof_videos))
         conn.commit()
-        
-        # Проверяем, что добавилось
-        cur.execute('SELECT username, label FROM scambase WHERE LOWER(username) = ?', (normalized,))
-        result = cur.fetchone()
         conn.close()
-        
-        return result is not None
+        return True
     except sqlite3.IntegrityError:
         return False
 
@@ -112,7 +149,7 @@ def add_to_scambase(username: str, label: str, admin_id: int, proof_photos: str 
 def remove_from_scambase(username: str) -> bool:
     """Удаление из базы"""
     normalized = normalize_username(username)
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('DELETE FROM scambase WHERE LOWER(username) = ?', (normalized,))
     deleted = cur.rowcount > 0
@@ -126,7 +163,7 @@ def update_label(username: str, new_label: str) -> bool:
     if new_label not in ['FAKE', 'SCAM', 'WORKER']:
         return False
     normalized = normalize_username(username)
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('UPDATE scambase SET label = ? WHERE LOWER(username) = ?', (new_label, normalized))
     updated = cur.rowcount > 0
@@ -138,7 +175,7 @@ def update_label(username: str, new_label: str) -> bool:
 def add_report(username: str, user_id: int, photos: list, videos: list) -> bool:
     """Добавление заявки"""
     normalized = normalize_username(username)
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('''
         INSERT INTO reports (username, reported_by, proof_photos, proof_videos, status, report_date)
@@ -151,7 +188,7 @@ def add_report(username: str, user_id: int, photos: list, videos: list) -> bool:
 
 def get_pending_reports() -> list:
     """Получение заявок"""
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('SELECT id, username, reported_by, proof_photos, proof_videos, report_date FROM reports WHERE status = "pending"')
     results = cur.fetchall()
@@ -162,7 +199,7 @@ def get_pending_reports() -> list:
 def approve_report(report_id: int, username: str, label: str, admin_id: int):
     """Одобрение заявки"""
     normalized = normalize_username(username)
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('UPDATE reports SET status = "approved" WHERE id = ?', (report_id,))
     cur.execute('''
@@ -175,7 +212,7 @@ def approve_report(report_id: int, username: str, label: str, admin_id: int):
 
 def reject_report(report_id: int):
     """Отклонение заявки"""
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('UPDATE reports SET status = "rejected" WHERE id = ?', (report_id,))
     conn.commit()
@@ -184,12 +221,66 @@ def reject_report(report_id: int):
 
 def list_all_users() -> list:
     """Для отладки - показать всех пользователей в базе"""
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('SELECT username, label, added_date FROM scambase ORDER BY added_date DESC')
     results = cur.fetchall()
     conn.close()
     return results
+
+
+def save_payment(user_id: int, username: str, amount: int, payment_id: str) -> bool:
+    """Сохранение информации об оплате"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO payments (user_id, username, amount, payment_id, status, payment_date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, amount, payment_id, 'completed', datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения платежа: {e}")
+        return False
+
+
+def register_user(user_id: int, username: str, first_name: str, last_name: str = ""):
+    """Регистрация пользователя для рассылки"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, joined_date, last_activity)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username or str(user_id), first_name, last_name, datetime.now().isoformat(), datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка регистрации пользователя: {e}")
+
+
+def get_all_users() -> list:
+    """Получение всех пользователей для рассылки"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('SELECT user_id, username, first_name FROM users')
+    results = cur.fetchall()
+    conn.close()
+    return results
+
+
+def update_user_activity(user_id: int):
+    """Обновление активности пользователя"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET last_activity = ? WHERE user_id = ?', (datetime.now().isoformat(), user_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка обновления активности: {e}")
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -214,6 +305,8 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🏷️ Выдать метку", callback_data="admin_label")
     builder.button(text="📋 Заявки от пользователей", callback_data="admin_reports")
     builder.button(text="📜 Список всех в базе", callback_data="admin_list")
+    builder.button(text="📢 Рассылка", callback_data="admin_mailing")
+    builder.button(text="📊 Статистика бота", callback_data="admin_stats")
     builder.button(text="🔙 Назад", callback_data="back_to_menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -230,10 +323,28 @@ def label_keyboard(username: str, action: str = "add") -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def mailing_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для рассылки"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Отправить", callback_data="mailing_send")
+    builder.button(text="❌ Отмена", callback_data="mailing_cancel")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 # ================= ОБЩИЕ ХЕНДЛЕРЫ =================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    is_admin_user = message.from_user.id in ADMIN_IDS
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    
+    # Регистрируем пользователя
+    register_user(user_id, username, first_name, last_name)
+    update_user_activity(user_id)
+    
+    is_admin_user = user_id in ADMIN_IDS
     await message.answer(
         "👋 Добро пожаловать в ScamBase Bot!\n\n"
         "🔍 Я помогу проверить, есть ли человек в базе скамеров.\n"
@@ -259,7 +370,7 @@ async def list_database(message: Message):
     label_emoji = {"FAKE": "🎭", "SCAM": "⚠️", "WORKER": "🛠️"}
     
     text = "📋 <b>Список всех в базе:</b>\n\n"
-    for username, label, date in users[:20]:  # Показываем максимум 20
+    for username, label, date in users[:20]:
         emoji = label_emoji.get(label, "📌")
         text += f"{emoji} @{username} — {label}\n"
         text += f"   📅 {date[:16]}\n\n"
@@ -272,6 +383,7 @@ async def list_database(message: Message):
 
 @dp.callback_query(F.data == "search")
 async def search_prompt(callback: CallbackQuery, state: FSMContext):
+    update_user_activity(callback.from_user.id)
     await callback.message.answer("🔍 Введите username человека для проверки (без @):")
     await callback.answer()
     await state.set_state("waiting_for_search")
@@ -279,6 +391,7 @@ async def search_prompt(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter("waiting_for_search"))
 async def perform_search(message: Message, state: FSMContext):
+    update_user_activity(message.from_user.id)
     username = normalize_username(message.text.strip())
     label = is_in_scambase(username)
     
@@ -312,7 +425,7 @@ async def perform_search(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "stats")
 async def show_stats(callback: CallbackQuery):
-    conn = sqlite3.connect('scambase.db')
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     
     cur.execute('SELECT COUNT(*) FROM scambase')
@@ -324,12 +437,20 @@ async def show_stats(callback: CallbackQuery):
     cur.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
     pending_reports = cur.fetchone()[0]
     
+    cur.execute('SELECT COUNT(*) FROM users')
+    total_users = cur.fetchone()[0]
+    
+    cur.execute('SELECT COUNT(*) FROM payments')
+    total_payments = cur.fetchone()[0]
+    
     conn.close()
     
     label_emoji = {"FAKE": "🎭", "SCAM": "⚠️", "WORKER": "🛠️"}
     
     stats_text = f"📊 <b>Статистика ScamBase</b> 📊\n\n"
     stats_text += f"👥 Всего в базе: <b>{total_scammers}</b>\n"
+    stats_text += f"👤 Пользователей бота: <b>{total_users}</b>\n"
+    stats_text += f"💰 Оплат звёздами: <b>{total_payments}</b>\n"
     stats_text += f"📋 Ожидающих заявок: <b>{pending_reports}</b>\n\n"
     stats_text += "<b>По меткам:</b>\n"
     
@@ -360,7 +481,8 @@ async def delete_self_prompt(callback: CallbackQuery):
         f"⚠️ <b>Вы находитесь в ScamBase!</b> ⚠️\n\n"
         f"Ваша метка: {user_label}\n\n"
         f"Вы можете удалить себя из базы за <b>{STAR_PRICE} ⭐</b>\n\n"
-        f"Нажмите на кнопку ниже, чтобы оплатить звёздами Telegram.",
+        f"Нажмите на кнопку ниже, чтобы оплатить звёздами Telegram.\n\n"
+        f"<i>После оплаты вы будете автоматически удалены из базы</i>",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -376,15 +498,16 @@ async def process_star_delete(callback: CallbackQuery):
             chat_id=user_id,
             title="Удаление из ScamBase",
             description="Удаление вашего профиля из базы ScamBase",
-            payload=f"delete_{user_id}",
+            payload=f"delete_{user_id}_{datetime.now().timestamp()}",
             currency="XTR",
-            prices=[types.LabeledPrice(label="Удаление", amount=STAR_PRICE)],
+            prices=[LabeledPrice(label="Удаление из ScamBase", amount=STAR_PRICE)],
             need_name=False,
             need_phone_number=False,
             need_email=False
         )
         await callback.answer("💫 Отправлен счёт на оплату звёздами!")
     except Exception as e:
+        logger.error(f"Ошибка отправки инвойса: {e}")
         await callback.message.answer(f"❌ Ошибка: {str(e)}\nПопробуйте позже.")
         await callback.answer()
 
@@ -396,9 +519,30 @@ async def pre_checkout_query(pre_checkout: types.PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
-    username = message.from_user.username or f"user_{message.from_user.id}"
+    user_id = message.from_user.id
+    username = message.from_user.username or f"user_{user_id}"
+    payment = message.successful_payment
     
+    # Сохраняем информацию об оплате
+    save_payment(user_id, username, payment.total_amount, payment.invoice_payload)
+    
+    # Удаляем пользователя из базы
     if remove_from_scambase(username):
+        # Уведомляем админов об оплате
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"💰 <b>Новая оплата звёздами!</b>\n\n"
+                    f"👤 Пользователь: @{username}\n"
+                    f"💸 Сумма: {payment.total_amount} ⭐\n"
+                    f"📅 Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"✅ Статус: Удалён из базы",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        
         await message.answer(
             "✅ <b>Оплата получена! Вы удалены из ScamBase.</b> ✅\n\n"
             "Ваше имя больше не числится в базе скамеров.\n"
@@ -408,7 +552,8 @@ async def successful_payment(message: Message):
     else:
         await message.answer(
             "❌ Ошибка: вас не было в базе данных.\n"
-            "Возможно, вы уже были удалены ранее."
+            "Возможно, вы уже были удалены ранее. Деньги будут возвращены?",
+            parse_mode="HTML"
         )
     
     is_admin_user = message.from_user.id in ADMIN_IDS
@@ -418,6 +563,7 @@ async def successful_payment(message: Message):
 # ================= ЗАЯВКИ НА СКАММЕРА =================
 @dp.callback_query(F.data == "report")
 async def report_start(callback: CallbackQuery, state: FSMContext):
+    update_user_activity(callback.from_user.id)
     await callback.message.answer(
         "📝 <b>Подача заявки на скамера</b>\n\n"
         "Введите username человека, которого вы хотите добавить в базу (без @):\n\n"
@@ -492,6 +638,7 @@ async def report_get_videos(message: Message, state: FSMContext):
     
     add_report(username, message.from_user.id, photos, videos)
     
+    # Уведомляем админов о новой заявке
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -504,8 +651,8 @@ async def report_get_videos(message: Message, state: FSMContext):
                 f"Используйте админ-панель для рассмотрения заявки.",
                 parse_mode="HTML"
             )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Ошибка уведомления админа: {e}")
     
     await message.answer(
         "✅ <b>Заявка успешно отправлена!</b> ✅\n\n"
@@ -538,6 +685,52 @@ async def admin_panel(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=admin_panel_keyboard()
     )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_bot_stats(callback: CallbackQuery):
+    """Показать подробную статистику бота для админов"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    
+    cur.execute('SELECT COUNT(*) FROM users')
+    total_users = cur.fetchone()[0]
+    
+    cur.execute('SELECT COUNT(*) FROM scambase')
+    total_scammers = cur.fetchone()[0]
+    
+    cur.execute('SELECT COUNT(*) FROM reports')
+    total_reports = cur.fetchone()[0]
+    
+    cur.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
+    pending_reports = cur.fetchone()[0]
+    
+    cur.execute('SELECT COUNT(*) FROM payments')
+    total_payments = cur.fetchone()[0]
+    
+    cur.execute('SELECT SUM(amount) FROM payments')
+    total_stars = cur.fetchone()[0] or 0
+    
+    cur.execute('SELECT COUNT(*) FROM users WHERE julianday("now") - julianday(last_activity) < 7')
+    active_users = cur.fetchone()[0]
+    
+    conn.close()
+    
+    stats_text = f"📊 <b>Детальная статистика бота</b> 📊\n\n"
+    stats_text += f"👥 Всего пользователей бота: <b>{total_users}</b>\n"
+    stats_text += f"🟢 Активных (за 7 дней): <b>{active_users}</b>\n"
+    stats_text += f"⚠️ В базе скамеров: <b>{total_scammers}</b>\n"
+    stats_text += f"📋 Всего заявок: <b>{total_reports}</b>\n"
+    stats_text += f"⏳ Ожидают рассмотрения: <b>{pending_reports}</b>\n"
+    stats_text += f"💰 Всего оплат: <b>{total_payments}</b>\n"
+    stats_text += f"⭐ Собрано звёзд: <b>{total_stars}</b>\n"
+    
+    await callback.message.answer(stats_text, parse_mode="HTML")
     await callback.answer()
 
 
@@ -639,13 +832,6 @@ async def admin_add_with_label(callback: CallbackQuery):
             f"🔍 <i>Теперь вы можете найти его через поиск</i>",
             parse_mode="HTML"
         )
-        
-        # Проверка
-        check = is_in_scambase(username)
-        if check:
-            await callback.message.answer(f"✅ <b>Проверка:</b> @{username} найден в базе с меткой {check}!")
-        else:
-            await callback.message.answer(f"❌ <b>Ошибка:</b> @{username} не найден после добавления!")
     else:
         await callback.message.answer(f"❌ Ошибка при добавлении пользователя @{username}.")
     
@@ -840,6 +1026,133 @@ async def admin_reject_report(callback: CallbackQuery):
     await callback.answer()
 
 
+# ================= РАССЫЛКА ДЛЯ АДМИНОВ =================
+@dp.callback_query(F.data == "admin_mailing")
+async def admin_mailing_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    await callback.message.answer(
+        "📢 <b>Рассылка сообщений</b>\n\n"
+        "Отправьте текст сообщения для рассылки всем пользователям бота.\n\n"
+        "<i>Поддерживается форматирование HTML.</i>\n"
+        "<i>Можно отправлять фото, видео, документы.</i>\n\n"
+        "Для отмены отправьте /cancel",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+    await state.set_state(MailingStates.waiting_for_message)
+
+
+@dp.message(MailingStates.waiting_for_message)
+async def admin_mailing_get_message(message: Message, state: FSMContext):
+    if message.text == "/cancel":
+        await message.answer("❌ Рассылка отменена.")
+        await state.clear()
+        return
+    
+    # Сохраняем сообщение
+    await state.update_data(mailing_message=message)
+    
+    # Получаем количество пользователей
+    users = get_all_users()
+    user_count = len(users)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, отправить", callback_data="mailing_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="mailing_cancel")]
+    ])
+    
+    await message.answer(
+        f"📢 <b>Предпросмотр рассылки</b>\n\n"
+        f"Сообщение будет отправлено <b>{user_count}</b> пользователям.\n\n"
+        f"<i>Вот как увидят ваше сообщение:</i>\n"
+        f"{'-'*30}\n",
+        parse_mode="HTML"
+    )
+    
+    # Пересылаем сообщение как предпросмотр
+    await message.forward(message.chat.id)
+    
+    await message.answer(
+        f"\n{'-'*30}\n\n"
+        f"Отправить рассылку?",
+        reply_markup=keyboard
+    )
+    await state.set_state(MailingStates.waiting_for_confirmation)
+
+
+@dp.callback_query(F.data == "mailing_confirm")
+async def admin_mailing_confirm(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    original_message = data.get('mailing_message')
+    
+    if not original_message:
+        await callback.message.answer("❌ Ошибка: сообщение не найдено.")
+        await state.clear()
+        return
+    
+    users = get_all_users()
+    sent = 0
+    failed = 0
+    
+    status_message = await callback.message.answer("📤 Начинаю рассылку...")
+    
+    for user_id, username, first_name in users:
+        try:
+            if original_message.text:
+                await bot.send_message(
+                    user_id,
+                    original_message.text,
+                    parse_mode="HTML"
+                )
+            elif original_message.photo:
+                await bot.send_photo(
+                    user_id,
+                    original_message.photo[-1].file_id,
+                    caption=original_message.caption
+                )
+            elif original_message.video:
+                await bot.send_video(
+                    user_id,
+                    original_message.video.file_id,
+                    caption=original_message.caption
+                )
+            sent += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+        
+        # Небольшая задержка, чтобы не спамить
+        await asyncio.sleep(0.05)
+    
+    await status_message.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📨 Отправлено: <b>{sent}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>\n"
+        f"👥 Всего пользователей: <b>{len(users)}</b>",
+        parse_mode="HTML"
+    )
+    
+    await state.clear()
+
+
+@dp.callback_query(F.data == "mailing_cancel")
+async def admin_mailing_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    await callback.message.answer("❌ Рассылка отменена.")
+    await callback.answer()
+    await state.clear()
+
+
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
     is_admin_user = callback.from_user.id in ADMIN_IDS
@@ -850,9 +1163,10 @@ async def back_to_menu(callback: CallbackQuery):
 # ================= ЗАПУСК =================
 async def main():
     init_db()
-    print("✅ Бот ScamBase запущен!")
-    print(f"👑 Администраторы: {ADMIN_IDS}")
-    print("🏷️ Доступные метки: FAKE, SCAM, WORKER")
+    logger.info("✅ Бот ScamBase запущен!")
+    logger.info(f"👑 Администраторы: {ADMIN_IDS}")
+    logger.info(f"🏷️ Доступные метки: FAKE, SCAM, WORKER")
+    logger.info(f"💾 База данных: {DB_PATH}")
     await dp.start_polling(bot)
 
 
