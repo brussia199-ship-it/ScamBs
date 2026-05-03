@@ -287,7 +287,7 @@ def update_user_activity(user_id: int):
 def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🔍 Поиск в ScamBase", callback_data="search")
-    builder.button(text="⭐ Удалить себя (В разработке...)", callback_data="delete_self")
+    builder.button(text="⭐ Удалить себя (В разработке...)", callback_data="")
     builder.button(text="📝 Подать заявку на скамера", callback_data="report")
     builder.button(text="📊 Статистика", callback_data="stats")
     
