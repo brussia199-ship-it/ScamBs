@@ -14,7 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8655931539:AAE9DjvBYScMBrutC17TP0UaLBc_jj_bo2U"  # Замените на ваш токен
-ADMIN_IDS = [7673683792]  # ID администраторов
+ADMIN_IDS = [7673683792]  # ID администраторов (укажите свой ID)
 STAR_PRICE = 500
 
 # ================= СОСТОЯНИЯ FSM =================
@@ -71,11 +71,17 @@ def init_db():
     conn.close()
 
 
+def normalize_username(username: str) -> str:
+    """Нормализация username - убираем @ и пробелы, приводим к нижнему регистру"""
+    return username.strip().replace('@', '').lower()
+
+
 def is_in_scambase(username: str) -> Optional[str]:
     """Проверка, есть ли человек в базе"""
+    normalized = normalize_username(username)
     conn = sqlite3.connect('scambase.db')
     cur = conn.cursor()
-    cur.execute('SELECT label FROM scambase WHERE username = ?', (username,))
+    cur.execute('SELECT label FROM scambase WHERE LOWER(username) = ?', (normalized,))
     result = cur.fetchone()
     conn.close()
     return result[0] if result else None
@@ -84,24 +90,31 @@ def is_in_scambase(username: str) -> Optional[str]:
 def add_to_scambase(username: str, label: str, admin_id: int, proof_photos: str = '', proof_videos: str = '') -> bool:
     """Добавление в базу"""
     try:
+        normalized = normalize_username(username)
         conn = sqlite3.connect('scambase.db')
         cur = conn.cursor()
         cur.execute('''
             INSERT INTO scambase (username, label, added_by, added_date, proof_photos, proof_videos)
             VALUES (?, ?, ?, ?, ?, ?)
-        ''', (username, label, admin_id, datetime.now().isoformat(), proof_photos, proof_videos))
+        ''', (normalized, label, admin_id, datetime.now().isoformat(), proof_photos, proof_videos))
         conn.commit()
+        
+        # Проверяем, что добавилось
+        cur.execute('SELECT username, label FROM scambase WHERE LOWER(username) = ?', (normalized,))
+        result = cur.fetchone()
         conn.close()
-        return True
+        
+        return result is not None
     except sqlite3.IntegrityError:
         return False
 
 
 def remove_from_scambase(username: str) -> bool:
     """Удаление из базы"""
+    normalized = normalize_username(username)
     conn = sqlite3.connect('scambase.db')
     cur = conn.cursor()
-    cur.execute('DELETE FROM scambase WHERE username = ?', (username,))
+    cur.execute('DELETE FROM scambase WHERE LOWER(username) = ?', (normalized,))
     deleted = cur.rowcount > 0
     conn.commit()
     conn.close()
@@ -112,9 +125,10 @@ def update_label(username: str, new_label: str) -> bool:
     """Обновление метки"""
     if new_label not in ['FAKE', 'SCAM', 'WORKER']:
         return False
+    normalized = normalize_username(username)
     conn = sqlite3.connect('scambase.db')
     cur = conn.cursor()
-    cur.execute('UPDATE scambase SET label = ? WHERE username = ?', (new_label, username))
+    cur.execute('UPDATE scambase SET label = ? WHERE LOWER(username) = ?', (new_label, normalized))
     updated = cur.rowcount > 0
     conn.commit()
     conn.close()
@@ -123,12 +137,13 @@ def update_label(username: str, new_label: str) -> bool:
 
 def add_report(username: str, user_id: int, photos: list, videos: list) -> bool:
     """Добавление заявки"""
+    normalized = normalize_username(username)
     conn = sqlite3.connect('scambase.db')
     cur = conn.cursor()
     cur.execute('''
         INSERT INTO reports (username, reported_by, proof_photos, proof_videos, status, report_date)
         VALUES (?, ?, ?, ?, ?, ?)
-    ''', (username, user_id, ','.join(photos), ','.join(videos), 'pending', datetime.now().isoformat()))
+    ''', (normalized, user_id, ','.join(photos), ','.join(videos), 'pending', datetime.now().isoformat()))
     conn.commit()
     conn.close()
     return True
@@ -146,13 +161,14 @@ def get_pending_reports() -> list:
 
 def approve_report(report_id: int, username: str, label: str, admin_id: int):
     """Одобрение заявки"""
+    normalized = normalize_username(username)
     conn = sqlite3.connect('scambase.db')
     cur = conn.cursor()
     cur.execute('UPDATE reports SET status = "approved" WHERE id = ?', (report_id,))
     cur.execute('''
         INSERT OR IGNORE INTO scambase (username, label, added_by, added_date)
         VALUES (?, ?, ?, ?)
-    ''', (username, label, admin_id, datetime.now().isoformat()))
+    ''', (normalized, label, admin_id, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -164,6 +180,16 @@ def reject_report(report_id: int):
     cur.execute('UPDATE reports SET status = "rejected" WHERE id = ?', (report_id,))
     conn.commit()
     conn.close()
+
+
+def list_all_users() -> list:
+    """Для отладки - показать всех пользователей в базе"""
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('SELECT username, label, added_date FROM scambase ORDER BY added_date DESC')
+    results = cur.fetchall()
+    conn.close()
+    return results
 
 
 # ================= КЛАВИАТУРЫ =================
@@ -187,13 +213,14 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="❌ Удалить из базы", callback_data="admin_remove")
     builder.button(text="🏷️ Выдать метку", callback_data="admin_label")
     builder.button(text="📋 Заявки от пользователей", callback_data="admin_reports")
+    builder.button(text="📜 Список всех в базе", callback_data="admin_list")
     builder.button(text="🔙 Назад", callback_data="back_to_menu")
     builder.adjust(1)
     return builder.as_markup()
 
 
 def label_keyboard(username: str, action: str = "add") -> InlineKeyboardMarkup:
-    """Клавиатура с новыми метками: FAKE, SCAM, WORKER"""
+    """Клавиатура с метками: FAKE, SCAM, WORKER"""
     builder = InlineKeyboardBuilder()
     builder.button(text="🎭 FAKE", callback_data=f"{action}_label_{username}_FAKE")
     builder.button(text="⚠️ SCAM", callback_data=f"{action}_label_{username}_SCAM")
@@ -216,6 +243,33 @@ async def cmd_start(message: Message):
     )
 
 
+@dp.message(Command("listdb"))
+async def list_database(message: Message):
+    """Команда для админов - показать всех в базе"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Доступ запрещён!")
+        return
+    
+    users = list_all_users()
+    
+    if not users:
+        await message.answer("📭 База данных пуста.")
+        return
+    
+    label_emoji = {"FAKE": "🎭", "SCAM": "⚠️", "WORKER": "🛠️"}
+    
+    text = "📋 <b>Список всех в базе:</b>\n\n"
+    for username, label, date in users[:20]:  # Показываем максимум 20
+        emoji = label_emoji.get(label, "📌")
+        text += f"{emoji} @{username} — {label}\n"
+        text += f"   📅 {date[:16]}\n\n"
+    
+    if len(users) > 20:
+        text += f"\n... и ещё {len(users) - 20} записей"
+    
+    await message.answer(text, parse_mode="HTML")
+
+
 @dp.callback_query(F.data == "search")
 async def search_prompt(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("🔍 Введите username человека для проверки (без @):")
@@ -225,10 +279,9 @@ async def search_prompt(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter("waiting_for_search"))
 async def perform_search(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    username = normalize_username(message.text.strip())
     label = is_in_scambase(username)
     
-    # Эмодзи для меток
     label_emoji = {
         "FAKE": "🎭",
         "SCAM": "⚠️",
@@ -377,9 +430,8 @@ async def report_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(ReportStates.waiting_for_username)
 async def report_get_username(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    username = normalize_username(message.text.strip())
     
-    # Проверяем, есть ли уже в базе
     existing_label = is_in_scambase(username)
     if existing_label:
         await message.answer(
@@ -440,7 +492,6 @@ async def report_get_videos(message: Message, state: FSMContext):
     
     add_report(username, message.from_user.id, photos, videos)
     
-    # Уведомляем админов
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -490,6 +541,35 @@ async def admin_panel(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "admin_list")
+async def admin_show_list(callback: CallbackQuery):
+    """Показать список всех в базе (админ)"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    users = list_all_users()
+    
+    if not users:
+        await callback.message.answer("📭 База данных пуста.")
+        await callback.answer()
+        return
+    
+    label_emoji = {"FAKE": "🎭", "SCAM": "⚠️", "WORKER": "🛠️"}
+    
+    text = "📋 <b>Список всех в базе:</b>\n\n"
+    for username, label, date in users[:20]:
+        emoji = label_emoji.get(label, "📌")
+        text += f"{emoji} @{username} — {label}\n"
+        text += f"   📅 {date[:16]}\n\n"
+    
+    if len(users) > 20:
+        text += f"\n... и ещё {len(users) - 20} записей"
+    
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
+
+
 # ================= ДОБАВЛЕНИЕ В БАЗУ (АДМИН) =================
 @dp.callback_query(F.data == "admin_add")
 async def admin_add_prompt(callback: CallbackQuery, state: FSMContext):
@@ -508,9 +588,8 @@ async def admin_add_prompt(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminAddStates.waiting_for_username)
 async def admin_add_get_username(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    username = normalize_username(message.text.strip())
     
-    # Проверяем, нет ли уже в базе
     existing = is_in_scambase(username)
     if existing:
         await message.answer(
@@ -540,15 +619,33 @@ async def admin_add_with_label(callback: CallbackQuery):
     username = parts[2]
     label = parts[3]
     
+    existing = is_in_scambase(username)
+    if existing:
+        await callback.message.answer(
+            f"⚠️ Пользователь @{username} <b>УЖЕ ЕСТЬ</b> в базе!\n"
+            f"Текущая метка: {existing}",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+    
     if add_to_scambase(username, label, callback.from_user.id):
         emoji = {"FAKE": "🎭", "SCAM": "⚠️", "WORKER": "🛠️"}.get(label, "📌")
         await callback.message.answer(
             f"✅ <b>Пользователь добавлен в ScamBase!</b>\n\n"
             f"👤 Username: @{username}\n"
             f"🏷️ Метка: {emoji} {label}\n"
-            f"👮 Добавил: {callback.from_user.full_name}",
+            f"👮 Добавил: {callback.from_user.full_name}\n\n"
+            f"🔍 <i>Теперь вы можете найти его через поиск</i>",
             parse_mode="HTML"
         )
+        
+        # Проверка
+        check = is_in_scambase(username)
+        if check:
+            await callback.message.answer(f"✅ <b>Проверка:</b> @{username} найден в базе с меткой {check}!")
+        else:
+            await callback.message.answer(f"❌ <b>Ошибка:</b> @{username} не найден после добавления!")
     else:
         await callback.message.answer(f"❌ Ошибка при добавлении пользователя @{username}.")
     
@@ -574,9 +671,8 @@ async def admin_remove_prompt(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminRemoveStates.waiting_for_username)
 async def admin_remove_user(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    username = normalize_username(message.text.strip())
     
-    # Проверяем, есть ли в базе
     existing = is_in_scambase(username)
     if not existing:
         await message.answer(
@@ -620,7 +716,7 @@ async def admin_label_prompt(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminLabelStates.waiting_for_username)
 async def admin_label_get_username(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    username = normalize_username(message.text.strip())
     
     existing = is_in_scambase(username)
     if not existing:
@@ -682,8 +778,6 @@ async def admin_show_reports(callback: CallbackQuery):
         await callback.message.answer("📭 Нет ожидающих заявок.")
         await callback.answer()
         return
-    
-    label_emoji = {"FAKE": "🎭", "SCAM": "⚠️", "WORKER": "🛠️"}
     
     for report in reports:
         report_id, username, reported_by, photos, videos, date = report
